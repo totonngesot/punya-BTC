@@ -14,6 +14,8 @@ import time
 import uuid
 import os
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 API = "https://api.trendbtc.app"
@@ -25,8 +27,11 @@ ACCOUNTS_BACKUP_FILE = os.path.join(SCRIPT_DIR, "accounts.txt.bak")
 STAKE_AMOUNT = 10
 MIN_STAKE_AMOUNT = 1     # USD. Sesuai batas minimum stake di situs TrendBTC ($1–$saldo). Kalau saldo di bawah ini, skip predict round tersebut
 STRATEGY_POOL = ["random", "minority", "crowd"]  # tiap akun pilih sendiri secara acak setiap round, jadi tiap akun bisa dapat pola berbeda-beda
-DELAY_MIN = 5    # detik, delay minimum antar akun
-DELAY_MAX = 15   # detik, delay maksimum antar akun
+DELAY_MIN = 0    # detik, jitter minimum sebelum akun mulai proses (anti-detection ringan, dijalankan paralel)
+DELAY_MAX = 6    # detik, jitter maksimum sebelum akun mulai proses
+MAX_PARALLEL_ACCOUNTS = 10  # batas akun yang diproses bersamaan sekaligus, biar tidak terlalu berat
+
+ACCOUNTS_FILE_LOCK = threading.Lock()  # lindungi penulisan accounts.txt dari race condition antar thread
 
 # Token persistence / refresh config
 ACCESS_TOKEN_MAX_AGE = 600   # detik. Refresh proaktif setelah ini (anggap access token ~15-30 menit, kita ambil margin aman 10 menit)
@@ -45,9 +50,12 @@ ONBOARDING_LIKE_CLICK_IDS = [
     "a541c604-db5b-48b6-8370-b820814a841e",
 ]
 
+_LOG_LOCK = threading.Lock()
+
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    with _LOG_LOCK:
+        print(f"[{ts}] {msg}", flush=True)
 
 class Account:
     """Satu akun TrendBTC dengan token management independen"""
@@ -62,24 +70,26 @@ class Account:
 
     def save_refresh_token(self, all_tokens):
         """Update token di accounts.txt secara atomic (tulis ke file sementara lalu rename),
-        supaya kalau proses mati di tengah jalan, accounts.txt lama tidak ikut rusak/kosong."""
-        all_tokens[self.idx] = self.refresh_token
-        tmp_path = ACCOUNTS_FILE + ".tmp"
-        try:
-            # Backup versi sebelum ditimpa, buat jaga-jaga/diagnosa
-            if os.path.exists(ACCOUNTS_FILE):
-                try:
-                    with open(ACCOUNTS_FILE, "r") as src, open(ACCOUNTS_BACKUP_FILE, "w") as bak:
-                        bak.write(src.read())
-                except Exception:
-                    pass
-            with open(tmp_path, "w") as f:
-                f.write("\n".join(all_tokens) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, ACCOUNTS_FILE)
-        except Exception as e:
-            log(f"  [Akun {self.idx+1}] ⚠️ Gagal menyimpan refresh token ke disk: {e}")
+        supaya kalau proses mati di tengah jalan, accounts.txt lama tidak ikut rusak/kosong.
+        Dilindungi lock karena beberapa akun bisa refresh bersamaan (thread paralel)."""
+        with ACCOUNTS_FILE_LOCK:
+            all_tokens[self.idx] = self.refresh_token
+            tmp_path = ACCOUNTS_FILE + ".tmp"
+            try:
+                # Backup versi sebelum ditimpa, buat jaga-jaga/diagnosa
+                if os.path.exists(ACCOUNTS_FILE):
+                    try:
+                        with open(ACCOUNTS_FILE, "r") as src, open(ACCOUNTS_BACKUP_FILE, "w") as bak:
+                            bak.write(src.read())
+                    except Exception:
+                        pass
+                with open(tmp_path, "w") as f:
+                    f.write("\n".join(all_tokens) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, ACCOUNTS_FILE)
+            except Exception as e:
+                log(f"  [Akun {self.idx+1}] ⚠️ Gagal menyimpan refresh token ke disk: {e}")
 
     def needs_refresh(self):
         """True kalau access token belum ada atau sudah mendekati kadaluarsa."""
@@ -129,20 +139,29 @@ class Account:
         return False
     
     def _request(self, method, path, headers, json_body=None):
-        """Kirim request dengan retry otomatis kalau kena timeout/connection error.
-        Error dari server (4xx/5xx dengan response) TIDAK diretry di sini, cuma
-        kegagalan koneksi/timeout yang biasanya cuma gangguan jaringan sesaat."""
+        """Kirim request dengan retry otomatis kalau kena timeout/connection error,
+        ATAU kalau server balas 5xx (503 dll — biasanya overload/down sesaat).
+        Error 4xx (token invalid, bad request, dll) TIDAK diretry karena itu bukan gangguan sesaat."""
         last_error = None
+        last_response = None
         for attempt in range(1, REQUEST_RETRY_ATTEMPTS + 1):
             try:
                 if method == "GET":
-                    return requests.get(f"{API}{path}", headers=headers, timeout=REQUEST_TIMEOUT)
+                    r = requests.get(f"{API}{path}", headers=headers, timeout=REQUEST_TIMEOUT)
                 else:
-                    return requests.post(f"{API}{path}", headers=headers, json=json_body, timeout=REQUEST_TIMEOUT)
+                    r = requests.post(f"{API}{path}", headers=headers, json=json_body, timeout=REQUEST_TIMEOUT)
+                if r.status_code >= 500:
+                    last_response = r
+                    if attempt < REQUEST_RETRY_ATTEMPTS:
+                        time.sleep(REQUEST_RETRY_DELAY)
+                        continue
+                return r
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                 last_error = e
                 if attempt < REQUEST_RETRY_ATTEMPTS:
                     time.sleep(REQUEST_RETRY_DELAY)
+        if last_response is not None:
+            return last_response  # sudah diretry maksimal, tetap 5xx -> kembalikan apa adanya
         raise last_error
 
     def api_get(self, path, auth=True, all_tokens=None):
@@ -306,7 +325,8 @@ class Account:
         return result
 
     def claim_onboarding_like_tasks(self, all_tokens):
-        """Auto-claim task 'like' onboarding satu-satu berdasarkan clickId di ONBOARDING_LIKE_CLICK_IDS."""
+        """Auto-claim task 'like' onboarding satu-satu berdasarkan clickId di ONBOARDING_LIKE_CLICK_IDS.
+        Tiap klaim yang berhasil langsung dicoba dipakai buka box juga (kalau memang menghasilkan tiket)."""
         for click_id in ONBOARDING_LIKE_CLICK_IDS:
             result = self.api_post("/api/me/onboarding/claim", {"clickId": click_id}, all_tokens=all_tokens)
             if "error" in result:
@@ -315,6 +335,8 @@ class Account:
                 log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...): {msg[:150]}")
             else:
                 log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...) diklaim! {json.dumps(result)[:120]}")
+                time.sleep(1)
+                self._open_box_with_ticket(all_tokens)
             time.sleep(1)
     
     def claim_faucet(self, all_tokens):
@@ -546,17 +568,20 @@ def run_forever():
                 log(f"   Accounts: {len([a for a in accounts if a.alive])}/{len(accounts)} alive")
                 log("=" * 55)
                 
-                for acc in accounts:
-                    if not acc.alive:
-                        continue
+                alive_accounts = [a for a in accounts if a.alive]
+
+                def _run_one(acc):
                     try:
+                        # Jitter kecil biar tidak semua request nembak di detik yang sama persis
+                        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
                         acc.run_cycle(round_data, all_tokens)
                     except Exception as e:
                         log(f"  [Akun {acc.idx+1}] ❌ Error: {e}")
-                    
-                    # Delay antar akun (anti-detection)
-                    delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                    time.sleep(delay)
+
+                with ThreadPoolExecutor(max_workers=min(len(alive_accounts), MAX_PARALLEL_ACCOUNTS) or 1) as executor:
+                    futures = [executor.submit(_run_one, acc) for acc in alive_accounts]
+                    for f in futures:
+                        f.result()  # tunggu semua akun selesai sebelum lanjut ke ringkasan
                 
                 log("=" * 55)
                 log(f"✅ All accounts done. Next round in ~15 min.")
