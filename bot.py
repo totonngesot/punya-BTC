@@ -165,7 +165,7 @@ class Account:
         try:
             data = r.json()
         except:
-            data = {"error": r.text[:200]}
+            data = {"error": f"HTTP {r.status_code} (server error, respons bukan JSON — kemungkinan server sedang down)"}
         if r.status_code in (200, 201):
             return data
         if "error" not in data:
@@ -192,7 +192,7 @@ class Account:
         try:
             data = r.json()
         except:
-            data = {"error": r.text[:200]}
+            data = {"error": f"HTTP {r.status_code} (server error, respons bukan JSON — kemungkinan server sedang down)"}
         if r.status_code in (200, 201):
             return data
         if "error" not in data:
@@ -297,11 +297,7 @@ class Account:
         if "error" in result:
             err = result["error"]
             msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-            low = msg.lower()
-            if "already" in low or "claimed" in low or "not eligible" in low or "cooldown" in low:
-                pass  # Sudah pernah diklaim / belum eligible, jangan spam log tiap cycle
-            else:
-                log(f"  [Akun {self.idx+1}] 🎫 Onboarding claim: {msg[:100]}")
+            log(f"  [Akun {self.idx+1}] 🎫 Onboarding ticket: {msg[:150]}")
             return None
 
         log(f"  [Akun {self.idx+1}] 🎫 Onboarding ticket diklaim! {json.dumps(result)[:150]}")
@@ -316,11 +312,7 @@ class Account:
             if "error" in result:
                 err = result["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                low = msg.lower()
-                if "already" in low or "claimed" in low or "not eligible" in low or "cooldown" in low:
-                    pass  # Sudah pernah diklaim, jangan spam log
-                else:
-                    log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...) gagal: {msg[:100]}")
+                log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...): {msg[:150]}")
             else:
                 log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...) diklaim! {json.dumps(result)[:120]}")
             time.sleep(1)
