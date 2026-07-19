@@ -22,9 +22,9 @@ ACCOUNTS_FILE = os.path.join(SCRIPT_DIR, "accounts.txt")
 ACCOUNTS_BACKUP_FILE = os.path.join(SCRIPT_DIR, "accounts.txt.bak")
 
 # Strategy config
-STAKE_AMOUNT = 25
+STAKE_AMOUNT = 10
 MIN_STAKE_AMOUNT = 1     # USD. Sesuai batas minimum stake di situs TrendBTC ($1–$saldo). Kalau saldo di bawah ini, skip predict round tersebut
-STRATEGY_POOL = ["random", "minority", "crowd"]  # tiap akun pilih strategi sendiri secara acak setiap round, supaya tidak semua akun bergerak sama
+STRATEGY_POOL = ["random", "minority", "crowd"]  # tiap akun pilih sendiri secara acak setiap round, jadi tiap akun bisa dapat pola berbeda-beda
 DELAY_MIN = 5    # detik, delay minimum antar akun
 DELAY_MAX = 15   # detik, delay maksimum antar akun
 
@@ -32,6 +32,18 @@ DELAY_MAX = 15   # detik, delay maksimum antar akun
 ACCESS_TOKEN_MAX_AGE = 600   # detik. Refresh proaktif setelah ini (anggap access token ~15-30 menit, kita ambil margin aman 10 menit)
 REFRESH_RETRY_ATTEMPTS = 3   # jumlah percobaan ulang kalau refresh gagal karena error jaringan (bukan token invalid)
 REFRESH_RETRY_DELAY = 5      # detik antar percobaan ulang
+
+# Retry untuk request API biasa (predict, balance, box, dll) kalau timeout/koneksi bermasalah
+REQUEST_TIMEOUT = 20         # detik, dinaikkan sedikit dari 15 karena koneksi mobile kadang lambat
+REQUEST_RETRY_ATTEMPTS = 3
+REQUEST_RETRY_DELAY = 3      # detik antar percobaan ulang
+
+# Task "like" (onboarding) yang mau di-auto-claim, diidentifikasi lewat clickId masing-masing
+ONBOARDING_LIKE_CLICK_IDS = [
+    "f033f540-0043-4021-98ae-92fb9ab7e2f2",
+    "970f3136-1eb3-4f57-9d33-574656261062",
+    "a541c604-db5b-48b6-8370-b820814a841e",
+]
 
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -116,17 +128,40 @@ class Account:
         # supaya masih dicoba lagi di siklus berikutnya dengan refresh_token yang sama.
         return False
     
+    def _request(self, method, path, headers, json_body=None):
+        """Kirim request dengan retry otomatis kalau kena timeout/connection error.
+        Error dari server (4xx/5xx dengan response) TIDAK diretry di sini, cuma
+        kegagalan koneksi/timeout yang biasanya cuma gangguan jaringan sesaat."""
+        last_error = None
+        for attempt in range(1, REQUEST_RETRY_ATTEMPTS + 1):
+            try:
+                if method == "GET":
+                    return requests.get(f"{API}{path}", headers=headers, timeout=REQUEST_TIMEOUT)
+                else:
+                    return requests.post(f"{API}{path}", headers=headers, json=json_body, timeout=REQUEST_TIMEOUT)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_error = e
+                if attempt < REQUEST_RETRY_ATTEMPTS:
+                    time.sleep(REQUEST_RETRY_DELAY)
+        raise last_error
+
     def api_get(self, path, auth=True, all_tokens=None):
         if auth and all_tokens is not None and self.needs_refresh():
             self.refresh_access(all_tokens)
         headers = {}
         if auth:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        r = requests.get(f"{API}{path}", headers=headers, timeout=15)
+        try:
+            r = self._request("GET", path, headers)
+        except Exception as e:
+            return {"error": f"Koneksi gagal: {e}"}
         if r.status_code == 401 and all_tokens:
             if self.refresh_access(all_tokens):
                 headers["Authorization"] = f"Bearer {self.access_token}"
-                r = requests.get(f"{API}{path}", headers=headers, timeout=15)
+                try:
+                    r = self._request("GET", path, headers)
+                except Exception as e:
+                    return {"error": f"Koneksi gagal: {e}"}
         try:
             data = r.json()
         except:
@@ -143,11 +178,17 @@ class Account:
         headers = {"Content-Type": "application/json"}
         if auth:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        r = requests.post(f"{API}{path}", headers=headers, json=body, timeout=15)
+        try:
+            r = self._request("POST", path, headers, json_body=body)
+        except Exception as e:
+            return {"error": f"Koneksi gagal: {e}"}
         if r.status_code == 401 and all_tokens:
             if self.refresh_access(all_tokens):
                 headers["Authorization"] = f"Bearer {self.access_token}"
-                r = requests.post(f"{API}{path}", headers=headers, json=body, timeout=15)
+                try:
+                    r = self._request("POST", path, headers, json_body=body)
+                except Exception as e:
+                    return {"error": f"Koneksi gagal: {e}"}
         try:
             data = r.json()
         except:
@@ -203,6 +244,32 @@ class Account:
             return None
         return result
     
+    def _box_reward_type(self, result):
+        """Ambil rewardType dari hasil buka box, tahan banting kalau strukturnya beda-beda."""
+        opening = result.get("opening", result) if isinstance(result, dict) else {}
+        return str(opening.get("rewardType", "")).upper()
+
+    def _open_box_with_ticket(self, all_tokens, max_chain=5):
+        """Buka box pakai tiket yang sudah dimiliki. Kalau reward yang keluar berupa tiket lagi,
+        langsung dipakai lagi (chaining) sampai max_chain kali atau sampai kehabisan/gagal."""
+        chain_attempts = 0
+        last_result = None
+        while chain_attempts < max_chain:
+            chain_attempts += 1
+            ticket_result = self.api_post("/api/boxes/trend_box_standard/open", {"useTicket": True}, all_tokens=all_tokens)
+            if "error" in ticket_result:
+                err = ticket_result["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                log(f"  [Akun {self.idx+1}] 🎟️ Pakai tiket gagal: {msg[:100]}")
+                break
+            log(f"  [Akun {self.idx+1}] 🎟️ Box dibuka pakai tiket! {json.dumps(ticket_result)[:150]}")
+            last_result = ticket_result
+            reward_type = self._box_reward_type(ticket_result)
+            if "TICKET" not in reward_type:
+                break
+            time.sleep(1)
+        return last_result
+
     def open_box(self, all_tokens):
         result = self.api_post("/api/boxes/trend_box_standard/open", {"useTicket": False}, all_tokens=all_tokens)
         if "error" in result:
@@ -215,7 +282,48 @@ class Account:
                     log(f"  [Akun {self.idx+1}] 📦 Box: {msg[:100]}")
             return None
         log(f"  [Akun {self.idx+1}] 📦 Box opened! {json.dumps(result)[:150]}")
+
+        # Kalau reward-nya berupa TIKET, langsung dipakai buat buka box tambahan (tanpa nunggu cooldown)
+        reward_type = self._box_reward_type(result)
+        if "TICKET" in reward_type:
+            time.sleep(1)
+            self._open_box_with_ticket(all_tokens)
+
         return result
+
+    def claim_onboarding_ticket(self, all_tokens):
+        """Klaim tiket dari endpoint onboarding, lalu langsung pakai buat buka box."""
+        result = self.api_post("/api/me/onboarding/claim", {}, all_tokens=all_tokens)
+        if "error" in result:
+            err = result["error"]
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            low = msg.lower()
+            if "already" in low or "claimed" in low or "not eligible" in low or "cooldown" in low:
+                pass  # Sudah pernah diklaim / belum eligible, jangan spam log tiap cycle
+            else:
+                log(f"  [Akun {self.idx+1}] 🎫 Onboarding claim: {msg[:100]}")
+            return None
+
+        log(f"  [Akun {self.idx+1}] 🎫 Onboarding ticket diklaim! {json.dumps(result)[:150]}")
+        time.sleep(1)
+        self._open_box_with_ticket(all_tokens)
+        return result
+
+    def claim_onboarding_like_tasks(self, all_tokens):
+        """Auto-claim task 'like' onboarding satu-satu berdasarkan clickId di ONBOARDING_LIKE_CLICK_IDS."""
+        for click_id in ONBOARDING_LIKE_CLICK_IDS:
+            result = self.api_post("/api/me/onboarding/claim", {"clickId": click_id}, all_tokens=all_tokens)
+            if "error" in result:
+                err = result["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                low = msg.lower()
+                if "already" in low or "claimed" in low or "not eligible" in low or "cooldown" in low:
+                    pass  # Sudah pernah diklaim, jangan spam log
+                else:
+                    log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...) gagal: {msg[:100]}")
+            else:
+                log(f"  [Akun {self.idx+1}] 👍 Like task ({click_id[:8]}...) diklaim! {json.dumps(result)[:120]}")
+            time.sleep(1)
     
     def claim_faucet(self, all_tokens):
         status = self.api_get("/api/me/faucet", all_tokens=all_tokens)
@@ -288,6 +396,12 @@ class Account:
         
         # Box
         self.open_box(all_tokens)
+        
+        # Onboarding ticket (klaim tiket lalu langsung dipakai buka box)
+        self.claim_onboarding_ticket(all_tokens)
+        
+        # Onboarding "like" tasks (clickId spesifik)
+        self.claim_onboarding_like_tasks(all_tokens)
         
         # Faucet
         self.claim_faucet(all_tokens)
